@@ -205,7 +205,7 @@ Usage::
     - `self`
 
 **Public Methods (60):**
-- `def setup(self, settings_url, middlewares = None, prefix = '', **kwargs)`
+- `def setup(self, settings_url, middlewares = None, prefix = '', key_include_func = True, **kwargs)`
   - **Docstring:**
   `````
   Configure the cache backend from a URL.
@@ -214,6 +214,9 @@ Usage::
       settings_url: URL like 'mem://', 'redis://host:port/db'.
       middlewares: List of Middleware instances.
       prefix: Global key prefix.
+      key_include_func: If False, the module path and function name are NOT
+          included in auto-generated cache keys. Useful for short, business-logic-only
+          keys. Default is True.
       **kwargs: Extra arguments passed to the backend.
   
   Supported URL schemes: mem://, redis://, rediss://, dual://
@@ -305,7 +308,7 @@ Usage::
       async with cache.transaction() as tx:
           tx.set("k1", "v1")
   `````
-- `def cache(self, ttl, key = None, condition = None, prefix = '', lock = False, lock_ttl = None, tags = (), serializer = None)`
+- `def cache(self, ttl, key = None, condition = None, prefix = '', lock = False, lock_ttl = None, tags = (), serializer = None, key_include_func: bool = None)`
 - `def failover(self, ttl, key = None, exceptions = None, condition = None, prefix = 'fail', tags = (), serializer = None)`
 - `def early(self, ttl, key = None, early_ttl = None, condition = None, prefix = 'early', tags = (), serializer = None)`
 - `def soft(self, ttl, key = None, soft_ttl = None, condition = None, prefix = 'soft', tags = (), serializer = None)`
@@ -495,16 +498,18 @@ def get_user(user_id):
 async def get_user_async(user_id):
     return await db.query_async(user_id)
 
-# 加锁防止缓存击穿
+# 加锁防止缓存击穿,如果123这个入参没有缓存，但是同一秒请求123这个入参1万次，
+# 加上lock=True后，只有第一次请求会真正执行函数，其余请求等待并复用第一次请求的结果，避免"击穿"。
 @cache.cache(ttl=60, lock=True)
 def get_hot_data(key):
+    time.sleep(20)
     return expensive_query(key)
 ```
 
 ## 不想吃苦，如何使用ai掌握nb_cache？
 
 `nb_cache_all_docs_and_codes.md` 这个文件包含了nb_cache 的教程和全部源码。 
-你把这个文件发送给ai，ai就能自动帮你掌握 `nb_cache` 的用法。 
+你把这个文件发送给deepseek ai [https://chat.deepseek.com/](https://chat.deepseek.com/) ，ai就能自动帮你掌握 `nb_cache` 的用法。 
 
 
 ## 对比 cashews
@@ -1100,6 +1105,94 @@ def check_permission(user, action):
     return db.query_permission(user['id'], action)
 ```
 
+### key_include_func 参数说明
+
+默认情况下，`nb_cache` 会把 **模块路径 + 函数名** 自动拼入 cache key，以确保不同模块的同名函数不会冲突：
+
+```
+# 默认生成的 key（含函数信息）
+testp2:myapp.services:get_user:user_id:42
+```
+
+如果你已经通过 `key=` 参数自己指定了业务 key 模板，这段模块+函数前缀往往是多余的噪音。
+设置 `key_include_func=False` 后，key 只保留业务部分：
+
+```
+# key_include_func=False 后生成的 key
+testp2:user:42
+```
+
+#### 设置级别
+
+`key_include_func` 支持两个层级，**装饰器上的值优先于 `setup()` 的默认值**。
+
+**1. `setup()` 级别 —— 影响该实例下所有装饰器**
+
+```python
+from nb_cache import Cache
+
+cache = Cache().setup("redis://localhost:6379/0", prefix="myapp", key_include_func=False)
+
+@cache.cache(ttl=300, key="user:{user_id}")
+def get_user(user_id):
+    return db.query(user_id)
+# final_key → myapp:user:42
+
+@cache.cache(ttl=60, key="order:{order_id}")
+def get_order(order_id):
+    return db.query_order(order_id)
+# final_key → myapp:order:100
+```
+
+**2. 装饰器级别 —— 覆盖 `setup()` 的默认值，只影响当前函数**
+
+```python
+cache = Cache().setup("redis://localhost:6379/0", prefix="myapp")
+# 默认 key_include_func=True
+
+@cache.cache(ttl=300, key="user:{user_id}")
+def get_user(user_id):
+    ...
+# final_key → myapp:mymodule:get_user:user:{user_id} → myapp:mymodule:get_user:user:42
+
+@cache.cache(ttl=60, key="order:{order_id}", key_include_func=False)
+def get_order(order_id):
+    ...
+# final_key → myapp:order:100  （单独关闭，不含函数名）
+```
+
+#### 不指定 key= 时的行为
+
+当不传 `key=` 参数，`nb_cache` 会根据函数签名自动生成 key。
+此时 `key_include_func=False` 意味着 key 只由参数值组成，**极易碰撞**，不推荐在此场景下使用：
+
+```python
+# 不推荐：不指定 key= 且 key_include_func=False
+@cache.cache(ttl=60, key_include_func=False)
+def get_user(user_id):
+    ...
+# final_key → myapp:user_id=42   ← 与其他相同签名函数会冲突
+```
+
+#### 如何预览生成的 key（不调用函数）
+
+```python
+from nb_cache.key import get_cache_key, get_cache_key_template
+
+# 方式1：从已装饰函数取模板（推荐）
+template = get_user._cache_key_template
+logic_key = get_cache_key(get_user, template, (42,), {})
+final_key = cache._backend._make_key(logic_key)
+print(final_key)  # myapp:user:42
+
+# 方式2：直接用工具函数生成（不需要先装饰）
+tpl = get_cache_key_template(get_user, key="user:{user_id}", key_include_func=False)
+key = get_cache_key(get_user, tpl, (42,), {})
+print(key)  # user:42
+```
+
+---
+
 ## 锁（上下文管理器）
 
 ```python
@@ -1212,22 +1305,68 @@ def get_data():
 
 ## 常见问题解答
 
-#### 如何查看缓存最终生成的key是什么？ 
+### 问题1：如何查看缓存最终生成的key是什么？ 
 
+
+#### 方式一：通过日志查看
 ```
-因为nb_cache 已经在 nb_cache.key 日志命名空间，用debug 日志级别打印了最终生成的key。
+因为nb_cache 已经在 nb_cache.cache 日志命名空间，用debug 日志级别打印了最终生成的key。
 
 所以你可以通过nb_log来查看：
- nb_log.get_logger('nb_cache.key')
+ nb_log.get_logger('nb_cache.cache')
 
 也可以通过 原生logging 来查看:
-logger = logging.getLogger("nb_cache.key")
+logger = logging.getLogger("nb_cache.cache")
 logger.setLevel(logging.DEBUG)
 logger.addHandler(logging.StreamHandler())
-
 ```
 
+日志例子：
+```
+2026-02-28 18:46:01 - nb_cache.cache - "D:\codes\nb_cache\nb_cache\decorators\cache.py:61" - async_wrapper - DEBUG - [nb_cache] func=__main__:aio_fun  final_key=testp2:__main__:aio_fun:aiof:3_4  ttl=700.0
+```
 
+#### 方式二：不调用函数，直接预览 cache key
+
+```python
+# -*- coding: utf-8 -*-
+"""nb_cache key 生成 Demo"""
+import sys
+import asyncio
+from nb_cache import Cache
+from nb_cache.key import get_cache_key, get_cache_key_template
+import nb_log
+
+nb_log.get_logger("nb_cache.cache")
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+cache = Cache()
+cache.setup("redis://", prefix="testp2")
+
+
+@cache.cache(ttl=700,key='sf:{a}_{b}')
+def simple_func(a, b):
+    return a + b
+
+print(simple_func(1, 2))
+
+# --- 不调用函数，直接预览 cache key ---
+# 方式1：从装饰后的函数取模板属性（推荐）
+template = simple_func._cache_key_template
+logic_key = get_cache_key(simple_func, template, (1, 2), {})
+final_key = cache._backend._make_key(logic_key)
+print("logic_key:", logic_key)   # 不含 prefix
+print("final_key:", final_key)   # 含 prefix，与 Redis 中一致
+
+# 方式2：用工具函数直接生成，不需要先装饰
+def raw_func(a, b):
+    return a + b
+tpl = get_cache_key_template(raw_func, key='sf:{a}_{b}')
+key2 = get_cache_key(raw_func, tpl, (1, 2), {})
+print("key2 (无prefix):", key2)
+```
 
 ## 许可证
 
@@ -1792,17 +1931,16 @@ Cache key generation and template utilities.
 
 - `import hashlib`
 - `import inspect`
-- `import logging`
 - `import re`
 
 #### 🔧 Public Functions (3)
 
 - `def get_func_name(func)`
-  - *Line: 14*
+  - *Line: 11*
   - *Get a stable, qualified name for a function.*
 
 - `def get_cache_key(func, key_template, args, kwargs)`
-  - *Line: 21*
+  - *Line: 18*
   - **Docstring:**
   `````
   Build a concrete cache key from a function call and optional template.
@@ -1813,15 +1951,24 @@ Cache key generation and template utilities.
     - callable: call with the same (args, kwargs) and return the key string
   `````
 
-- `def get_cache_key_template(func, key = None, prefix = '')`
-  - *Line: 42*
+- `def get_cache_key_template(func, key = None, prefix = '', key_include_func = True)`
+  - *Line: 38*
   - **Docstring:**
   `````
   Build a key template (string or callable) for a function.
   
   When key is a callable, it is stored as-is and will be called at cache time.
-  When key is a string template, it is prefixed with func_name.
+  When key is a string template, it is prefixed with func_name (if include_func_name=True).
   When key is None, auto-generate a template from the function signature.
+  
+  Args:
+      func: The decorated function.
+      key: Key template string or callable. None means auto-generate.
+      prefix: Key prefix string (from decorator or setup).
+      key_include_func: If False, the module path and function name are NOT
+          included in the generated key. Useful when you want a short,
+          purely business-logic key (e.g. ``aiof:3_4`` instead of
+          ``__main__:aio_fun:aiof:3_4``).
   `````
 
 
@@ -1832,13 +1979,10 @@ Cache key generation and template utilities.
 """Cache key generation and template utilities."""
 import hashlib
 import inspect
-import logging
 import re
 
 # Matches {param}, {param:fmt}, {param.attr}, {param.attr:fmt}
 _TEMPLATE_PARAM_RE = re.compile(r'\{([\w.]+)(?::(\w+))?\}')
-
-logger = logging.getLogger("nb_cache.key")
 
 
 def get_func_name(func):
@@ -1865,24 +2009,37 @@ def get_cache_key(func, key_template, args, kwargs):
     else:
         key = _render_template(func, key_template, args, kwargs)
 
-    logger.debug("[nb_cache] func=%s  key=%s", get_func_name(func), key)
     return key
 
 
-def get_cache_key_template(func, key=None, prefix=""):
+def get_cache_key_template(func, key=None, prefix="", key_include_func=True):
     """Build a key template (string or callable) for a function.
 
     When key is a callable, it is stored as-is and will be called at cache time.
-    When key is a string template, it is prefixed with func_name.
+    When key is a string template, it is prefixed with func_name (if include_func_name=True).
     When key is None, auto-generate a template from the function signature.
+
+    Args:
+        func: The decorated function.
+        key: Key template string or callable. None means auto-generate.
+        prefix: Key prefix string (from decorator or setup).
+        key_include_func: If False, the module path and function name are NOT
+            included in the generated key. Useful when you want a short,
+            purely business-logic key (e.g. ``aiof:3_4`` instead of
+            ``__main__:aio_fun:aiof:3_4``).
     """
     func_name = get_func_name(func)
     if key is not None:
         if callable(key):
             return key
-        if prefix:
-            return "{}:{}:{}".format(prefix, func_name, key)
-        return "{}:{}".format(func_name, key)
+        if key_include_func:
+            if prefix:
+                return "{}:{}:{}".format(prefix, func_name, key)
+            return "{}:{}".format(func_name, key)
+        else:
+            if prefix:
+                return "{}:{}".format(prefix, key)
+            return key
 
     sig = inspect.signature(func)
     parts = []
@@ -1892,9 +2049,14 @@ def get_cache_key_template(func, key=None, prefix=""):
         parts.append("{{{name}}}".format(name=name))
 
     template = ":".join(parts) if parts else ""
-    if prefix:
-        return "{}:{}:{}".format(prefix, func_name, template)
-    return "{}:{}".format(func_name, template)
+    if key_include_func:
+        if prefix:
+            return "{}:{}:{}".format(prefix, func_name, template)
+        return "{}:{}".format(func_name, template)
+    else:
+        if prefix:
+            return "{}:{}".format(prefix, template) if template else prefix
+        return template
 
 
 def _resolve_attr(val, attr_path):
@@ -2910,7 +3072,7 @@ Usage::
     - `self`
 
 **Public Methods (60):**
-- `def setup(self, settings_url, middlewares = None, prefix = '', **kwargs)`
+- `def setup(self, settings_url, middlewares = None, prefix = '', key_include_func = True, **kwargs)`
   - **Docstring:**
   `````
   Configure the cache backend from a URL.
@@ -2919,6 +3081,9 @@ Usage::
       settings_url: URL like 'mem://', 'redis://host:port/db'.
       middlewares: List of Middleware instances.
       prefix: Global key prefix.
+      key_include_func: If False, the module path and function name are NOT
+          included in auto-generated cache keys. Useful for short, business-logic-only
+          keys. Default is True.
       **kwargs: Extra arguments passed to the backend.
   
   Supported URL schemes: mem://, redis://, rediss://, dual://
@@ -3010,7 +3175,7 @@ Usage::
       async with cache.transaction() as tx:
           tx.set("k1", "v1")
   `````
-- `def cache(self, ttl, key = None, condition = None, prefix = '', lock = False, lock_ttl = None, tags = (), serializer = None)`
+- `def cache(self, ttl, key = None, condition = None, prefix = '', lock = False, lock_ttl = None, tags = (), serializer = None, key_include_func: bool = None)`
 - `def failover(self, ttl, key = None, exceptions = None, condition = None, prefix = 'fail', tags = (), serializer = None)`
 - `def early(self, ttl, key = None, early_ttl = None, condition = None, prefix = 'early', tags = (), serializer = None)`
 - `def soft(self, ttl, key = None, soft_ttl = None, condition = None, prefix = 'soft', tags = (), serializer = None)`
@@ -3212,6 +3377,7 @@ class Cache(object):
         self._tag_registry = get_default_tag_registry()
         self._serializer = default_serializer
         self._is_setup = False
+        self._key_include_func = True
 
     @property
     def is_setup(self):
@@ -3223,13 +3389,16 @@ class Cache(object):
 
     # --- Setup ---
 
-    def setup(self, settings_url, middlewares=None, prefix="", **kwargs):
+    def setup(self, settings_url, middlewares=None, prefix="", key_include_func=True, **kwargs):
         """Configure the cache backend from a URL.
 
         Args:
             settings_url: URL like 'mem://', 'redis://host:port/db'.
             middlewares: List of Middleware instances.
             prefix: Global key prefix.
+            key_include_func: If False, the module path and function name are NOT
+                included in auto-generated cache keys. Useful for short, business-logic-only
+                keys. Default is True.
             **kwargs: Extra arguments passed to the backend.
 
         Supported URL schemes: mem://, redis://, rediss://, dual://
@@ -3264,6 +3433,7 @@ class Cache(object):
             comp = NullCompressor()
         self._serializer = Serializer(serializer=ser, compressor=comp, signer=signer)
 
+        self._key_include_func = key_include_func
         self._backend.init_sync()
         self._is_setup = True
         return self
@@ -3544,12 +3714,14 @@ class Cache(object):
     # --- Decorator shortcuts ---
 
     def cache(self, ttl, key=None, condition=None, prefix="", lock=False,
-              lock_ttl=None, tags=(), serializer=None):
+              lock_ttl=None, tags=(), serializer=None, key_include_func:bool=None):
         from nb_cache.decorators.cache import cache as _cache
+        _kif = self._key_include_func if key_include_func is None else key_include_func
         return _cache(ttl, key=key, condition=condition, prefix=prefix,
                       lock=lock, lock_ttl=lock_ttl, tags=tags,
                       backend=self._backend, serializer=serializer or self._serializer,
-                      tag_registry=self._tag_registry if tags else None)
+                      tag_registry=self._tag_registry if tags else None,
+                      key_include_func=_kif)
 
     def failover(self, ttl, key=None, exceptions=None, condition=None,
                  prefix="fail", tags=(), serializer=None):
@@ -5828,11 +6000,12 @@ Basic cache decorator with sync/async support and optional locking.
 
 - `import asyncio`
 - `import functools`
-- `import time`
+- `import logging`
 - `from nb_cache._compat import is_coroutine_function`
 - `from nb_cache.condition import get_cache_condition`
 - `from nb_cache.key import get_cache_key`
 - `from nb_cache.key import get_cache_key_template`
+- `from nb_cache.key import get_func_name`
 - `from nb_cache.serialize import default_serializer`
 - `from nb_cache.serialize import _SENTINEL`
 - `from nb_cache.ttl import ttl_to_seconds`
@@ -5841,8 +6014,8 @@ Basic cache decorator with sync/async support and optional locking.
 
 #### 🔧 Public Functions (4)
 
-- `def cache(ttl, key = None, condition = None, prefix = '', lock = False, lock_ttl = None, tags = (), backend = None, serializer = None, tag_registry = None)`
-  - *Line: 14*
+- `def cache(ttl, key = None, condition = None, prefix = '', lock = False, lock_ttl = None, tags = (), backend = None, serializer = None, tag_registry = None, key_include_func = True)`
+  - *Line: 23*
   - **Docstring:**
   `````
   Basic cache decorator.
@@ -5860,16 +6033,18 @@ Basic cache decorator with sync/async support and optional locking.
       backend: Cache backend instance. If None, uses the global default.
       serializer: Serializer instance. If None, uses default.
       tag_registry: TagRegistry instance for tag-based invalidation.
+      key_include_func: If False, module path and function name are excluded
+          from the generated key. Default True.
   `````
 
 - `def decorator(func)`
-  - *Line: 38*
-
-- `async def async_wrapper(*args, **kwargs)` `functools.wraps(func)`
   - *Line: 49*
 
+- `async def async_wrapper(*args, **kwargs)` `functools.wraps(func)`
+  - *Line: 60*
+
 - `def sync_wrapper(*args, **kwargs)` `functools.wraps(func)`
-  - *Line: 91*
+  - *Line: 104*
 
 
 ---
@@ -5879,18 +6054,27 @@ Basic cache decorator with sync/async support and optional locking.
 """Basic cache decorator with sync/async support and optional locking."""
 import asyncio
 import functools
-import time
+import logging
 
 from nb_cache._compat import is_coroutine_function
 from nb_cache.condition import get_cache_condition
-from nb_cache.key import get_cache_key, get_cache_key_template
+from nb_cache.key import get_cache_key, get_cache_key_template, get_func_name
 from nb_cache.serialize import default_serializer, _SENTINEL
 from nb_cache.ttl import ttl_to_seconds
+
+logger = logging.getLogger("nb_cache.cache")
+
+
+def _final_key(be, cache_key):
+    """通过 backend 的 _make_key 方法获取最终写入存储的完整 key。"""
+    if hasattr(be, '_make_key'):
+        return be._make_key(cache_key)
+    return cache_key
 
 
 def cache(ttl, key=None, condition=None, prefix="", lock=False,
           lock_ttl=None, tags=(), backend=None, serializer=None,
-          tag_registry=None):
+          tag_registry=None, key_include_func=True):
     """Basic cache decorator.
 
     Supports both sync and async functions transparently.
@@ -5906,6 +6090,8 @@ def cache(ttl, key=None, condition=None, prefix="", lock=False,
         backend: Cache backend instance. If None, uses the global default.
         serializer: Serializer instance. If None, uses default.
         tag_registry: TagRegistry instance for tag-based invalidation.
+        key_include_func: If False, module path and function name are excluded
+            from the generated key. Default True.
     """
     _condition = get_cache_condition(condition)
     _serializer = serializer or default_serializer
@@ -5913,7 +6099,7 @@ def cache(ttl, key=None, condition=None, prefix="", lock=False,
     _lock_ttl = ttl_to_seconds(lock_ttl) if lock_ttl else _ttl_seconds
 
     def decorator(func):
-        _key_template = get_cache_key_template(func, key, prefix)
+        _key_template = get_cache_key_template(func, key, prefix, key_include_func=key_include_func)
         _backend_ref = [backend]
         _registry = tag_registry
 
@@ -5926,6 +6112,8 @@ def cache(ttl, key=None, condition=None, prefix="", lock=False,
             async def async_wrapper(*args, **kwargs):
                 be = _get_backend()
                 cache_key = get_cache_key(func, _key_template, args, kwargs)
+                logger.debug("[nb_cache] func=%s  final_key=%s  ttl=%s",
+                             get_func_name(func), _final_key(be, cache_key), _ttl_seconds)
 
                 raw = await be.get(cache_key)
                 if raw is not None:
@@ -5968,6 +6156,8 @@ def cache(ttl, key=None, condition=None, prefix="", lock=False,
             def sync_wrapper(*args, **kwargs):
                 be = _get_backend()
                 cache_key = get_cache_key(func, _key_template, args, kwargs)
+                logger.debug("[nb_cache] func=%s  final_key=%s  ttl=%s",
+                             get_func_name(func), _final_key(be, cache_key), _ttl_seconds)
 
                 raw = be.get_sync(cache_key)
                 if raw is not None:
@@ -9611,7 +9801,9 @@ if __name__ == '__main__':
     pytest.main([__file__, '-v'])
 
 
-
+"""
+python -m pytest tests/ai_codes/test_core.py -v -p no:logfire
+"""
 `````
 
 --- **end of file: tests/ai_codes/test_core.py** (project: nb_cache) --- 

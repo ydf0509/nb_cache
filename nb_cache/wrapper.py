@@ -148,6 +148,7 @@ class Cache(object):
         self._tag_registry = get_default_tag_registry()
         self._serializer = default_serializer
         self._is_setup = False
+        self._key_include_func = True
 
     @property
     def is_setup(self):
@@ -159,13 +160,16 @@ class Cache(object):
 
     # --- Setup ---
 
-    def setup(self, settings_url, middlewares=None, prefix="", **kwargs):
+    def setup(self, settings_url, middlewares=None, prefix="", key_include_func=True, **kwargs):
         """Configure the cache backend from a URL.
 
         Args:
             settings_url: URL like 'mem://', 'redis://host:port/db'.
             middlewares: List of Middleware instances.
             prefix: Global key prefix.
+            key_include_func: If False, the module path and function name are NOT
+                included in auto-generated cache keys. Useful for short, business-logic-only
+                keys. Default is True.
             **kwargs: Extra arguments passed to the backend.
 
         Supported URL schemes: mem://, redis://, rediss://, dual://
@@ -200,6 +204,7 @@ class Cache(object):
             comp = NullCompressor()
         self._serializer = Serializer(serializer=ser, compressor=comp, signer=signer)
 
+        self._key_include_func = key_include_func
         self._backend.init_sync()
         self._is_setup = True
         return self
@@ -480,12 +485,14 @@ class Cache(object):
     # --- Decorator shortcuts ---
 
     def cache(self, ttl, key=None, condition=None, prefix="", lock=False,
-              lock_ttl=None, tags=(), serializer=None):
+              lock_ttl=None, tags=(), serializer=None, key_include_func:bool=None):
         from nb_cache.decorators.cache import cache as _cache
+        _kif = self._key_include_func if key_include_func is None else key_include_func
         return _cache(ttl, key=key, condition=condition, prefix=prefix,
                       lock=lock, lock_ttl=lock_ttl, tags=tags,
                       backend=self._backend, serializer=serializer or self._serializer,
-                      tag_registry=self._tag_registry if tags else None)
+                      tag_registry=self._tag_registry if tags else None,
+                      key_include_func=_kif)
 
     def failover(self, ttl, key=None, exceptions=None, condition=None,
                  prefix="fail", tags=(), serializer=None):

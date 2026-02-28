@@ -72,7 +72,8 @@ def get_user(user_id):
 async def get_user_async(user_id):
     return await db.query_async(user_id)
 
-# 加锁防止缓存击穿,如果123这个入参没有缓存，但是同一秒请求123这个入参1万次，加上lock=True后，只有第一次请求会真正执行函数，其余请求等待并复用第一次请求的结果，避免"击穿"。
+# 加锁防止缓存击穿,如果123这个入参没有缓存，但是同一秒请求123这个入参1万次，
+# 加上lock=True后，只有第一次请求会真正执行函数，其余请求等待并复用第一次请求的结果，避免"击穿"。
 @cache.cache(ttl=60, lock=True)
 def get_hot_data(key):
     time.sleep(20)
@@ -82,7 +83,7 @@ def get_hot_data(key):
 ## 不想吃苦，如何使用ai掌握nb_cache？
 
 `nb_cache_all_docs_and_codes.md` 这个文件包含了nb_cache 的教程和全部源码。 
-你把这个文件发送给ai，ai就能自动帮你掌握 `nb_cache` 的用法。 
+你把这个文件发送给deepseek ai [https://chat.deepseek.com/](https://chat.deepseek.com/) ，ai就能自动帮你掌握 `nb_cache` 的用法。 
 
 
 ## 对比 cashews
@@ -678,6 +679,94 @@ def check_permission(user, action):
     return db.query_permission(user['id'], action)
 ```
 
+### key_include_func 参数说明
+
+默认情况下，`nb_cache` 会把 **模块路径 + 函数名** 自动拼入 cache key，以确保不同模块的同名函数不会冲突：
+
+```
+# 默认生成的 key（含函数信息）
+testp2:myapp.services:get_user:user_id:42
+```
+
+如果你已经通过 `key=` 参数自己指定了业务 key 模板，这段模块+函数前缀往往是多余的噪音。
+设置 `key_include_func=False` 后，key 只保留业务部分：
+
+```
+# key_include_func=False 后生成的 key
+testp2:user:42
+```
+
+#### 设置级别
+
+`key_include_func` 支持两个层级，**装饰器上的值优先于 `setup()` 的默认值**。
+
+**1. `setup()` 级别 —— 影响该实例下所有装饰器**
+
+```python
+from nb_cache import Cache
+
+cache = Cache().setup("redis://localhost:6379/0", prefix="myapp", key_include_func=False)
+
+@cache.cache(ttl=300, key="user:{user_id}")
+def get_user(user_id):
+    return db.query(user_id)
+# final_key → myapp:user:42
+
+@cache.cache(ttl=60, key="order:{order_id}")
+def get_order(order_id):
+    return db.query_order(order_id)
+# final_key → myapp:order:100
+```
+
+**2. 装饰器级别 —— 覆盖 `setup()` 的默认值，只影响当前函数**
+
+```python
+cache = Cache().setup("redis://localhost:6379/0", prefix="myapp")
+# 默认 key_include_func=True
+
+@cache.cache(ttl=300, key="user:{user_id}")
+def get_user(user_id):
+    ...
+# final_key → myapp:mymodule:get_user:user:{user_id} → myapp:mymodule:get_user:user:42
+
+@cache.cache(ttl=60, key="order:{order_id}", key_include_func=False)
+def get_order(order_id):
+    ...
+# final_key → myapp:order:100  （单独关闭，不含函数名）
+```
+
+#### 不指定 key= 时的行为
+
+当不传 `key=` 参数，`nb_cache` 会根据函数签名自动生成 key。
+此时 `key_include_func=False` 意味着 key 只由参数值组成，**极易碰撞**，不推荐在此场景下使用：
+
+```python
+# 不推荐：不指定 key= 且 key_include_func=False
+@cache.cache(ttl=60, key_include_func=False)
+def get_user(user_id):
+    ...
+# final_key → myapp:user_id=42   ← 与其他相同签名函数会冲突
+```
+
+#### 如何预览生成的 key（不调用函数）
+
+```python
+from nb_cache.key import get_cache_key, get_cache_key_template
+
+# 方式1：从已装饰函数取模板（推荐）
+template = get_user._cache_key_template
+logic_key = get_cache_key(get_user, template, (42,), {})
+final_key = cache._backend._make_key(logic_key)
+print(final_key)  # myapp:user:42
+
+# 方式2：直接用工具函数生成（不需要先装饰）
+tpl = get_cache_key_template(get_user, key="user:{user_id}", key_include_func=False)
+key = get_cache_key(get_user, tpl, (42,), {})
+print(key)  # user:42
+```
+
+---
+
 ## 锁（上下文管理器）
 
 ```python
@@ -790,22 +879,68 @@ def get_data():
 
 ## 常见问题解答
 
-#### 如何查看缓存最终生成的key是什么？ 
+### 问题1：如何查看缓存最终生成的key是什么？ 
 
+
+#### 方式一：通过日志查看
 ```
-因为nb_cache 已经在 nb_cache.key 日志命名空间，用debug 日志级别打印了最终生成的key。
+因为nb_cache 已经在 nb_cache.cache 日志命名空间，用debug 日志级别打印了最终生成的key。
 
 所以你可以通过nb_log来查看：
- nb_log.get_logger('nb_cache.key')
+ nb_log.get_logger('nb_cache.cache')
 
 也可以通过 原生logging 来查看:
-logger = logging.getLogger("nb_cache.key")
+logger = logging.getLogger("nb_cache.cache")
 logger.setLevel(logging.DEBUG)
 logger.addHandler(logging.StreamHandler())
-
 ```
 
+日志例子：
+```
+2026-02-28 18:46:01 - nb_cache.cache - "D:\codes\nb_cache\nb_cache\decorators\cache.py:61" - async_wrapper - DEBUG - [nb_cache] func=__main__:aio_fun  final_key=testp2:__main__:aio_fun:aiof:3_4  ttl=700.0
+```
 
+#### 方式二：不调用函数，直接预览 cache key
+
+```python
+# -*- coding: utf-8 -*-
+"""nb_cache key 生成 Demo"""
+import sys
+import asyncio
+from nb_cache import Cache
+from nb_cache.key import get_cache_key, get_cache_key_template
+import nb_log
+
+nb_log.get_logger("nb_cache.cache")
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+cache = Cache()
+cache.setup("redis://", prefix="testp2")
+
+
+@cache.cache(ttl=700,key='sf:{a}_{b}')
+def simple_func(a, b):
+    return a + b
+
+print(simple_func(1, 2))
+
+# --- 不调用函数，直接预览 cache key ---
+# 方式1：从装饰后的函数取模板属性（推荐）
+template = simple_func._cache_key_template
+logic_key = get_cache_key(simple_func, template, (1, 2), {})
+final_key = cache._backend._make_key(logic_key)
+print("logic_key:", logic_key)   # 不含 prefix
+print("final_key:", final_key)   # 含 prefix，与 Redis 中一致
+
+# 方式2：用工具函数直接生成，不需要先装饰
+def raw_func(a, b):
+    return a + b
+tpl = get_cache_key_template(raw_func, key='sf:{a}_{b}')
+key2 = get_cache_key(raw_func, tpl, (1, 2), {})
+print("key2 (无prefix):", key2)
+```
 
 ## 许可证
 

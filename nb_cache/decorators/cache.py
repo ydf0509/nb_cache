@@ -2,18 +2,27 @@
 """Basic cache decorator with sync/async support and optional locking."""
 import asyncio
 import functools
-import time
+import logging
 
 from nb_cache._compat import is_coroutine_function
 from nb_cache.condition import get_cache_condition
-from nb_cache.key import get_cache_key, get_cache_key_template
+from nb_cache.key import get_cache_key, get_cache_key_template, get_func_name
 from nb_cache.serialize import default_serializer, _SENTINEL
 from nb_cache.ttl import ttl_to_seconds
+
+logger = logging.getLogger("nb_cache.cache")
+
+
+def _final_key(be, cache_key):
+    """通过 backend 的 _make_key 方法获取最终写入存储的完整 key。"""
+    if hasattr(be, '_make_key'):
+        return be._make_key(cache_key)
+    return cache_key
 
 
 def cache(ttl, key=None, condition=None, prefix="", lock=False,
           lock_ttl=None, tags=(), backend=None, serializer=None,
-          tag_registry=None):
+          tag_registry=None, key_include_func=True):
     """Basic cache decorator.
 
     Supports both sync and async functions transparently.
@@ -29,6 +38,8 @@ def cache(ttl, key=None, condition=None, prefix="", lock=False,
         backend: Cache backend instance. If None, uses the global default.
         serializer: Serializer instance. If None, uses default.
         tag_registry: TagRegistry instance for tag-based invalidation.
+        key_include_func: If False, module path and function name are excluded
+            from the generated key. Default True.
     """
     _condition = get_cache_condition(condition)
     _serializer = serializer or default_serializer
@@ -36,7 +47,7 @@ def cache(ttl, key=None, condition=None, prefix="", lock=False,
     _lock_ttl = ttl_to_seconds(lock_ttl) if lock_ttl else _ttl_seconds
 
     def decorator(func):
-        _key_template = get_cache_key_template(func, key, prefix)
+        _key_template = get_cache_key_template(func, key, prefix, key_include_func=key_include_func)
         _backend_ref = [backend]
         _registry = tag_registry
 
@@ -49,6 +60,8 @@ def cache(ttl, key=None, condition=None, prefix="", lock=False,
             async def async_wrapper(*args, **kwargs):
                 be = _get_backend()
                 cache_key = get_cache_key(func, _key_template, args, kwargs)
+                logger.debug("[nb_cache] func=%s  final_key=%s  ttl=%s",
+                             get_func_name(func), _final_key(be, cache_key), _ttl_seconds)
 
                 raw = await be.get(cache_key)
                 if raw is not None:
@@ -91,6 +104,8 @@ def cache(ttl, key=None, condition=None, prefix="", lock=False,
             def sync_wrapper(*args, **kwargs):
                 be = _get_backend()
                 cache_key = get_cache_key(func, _key_template, args, kwargs)
+                logger.debug("[nb_cache] func=%s  final_key=%s  ttl=%s",
+                             get_func_name(func), _final_key(be, cache_key), _ttl_seconds)
 
                 raw = be.get_sync(cache_key)
                 if raw is not None:

@@ -2,13 +2,10 @@
 """Cache key generation and template utilities."""
 import hashlib
 import inspect
-import logging
 import re
 
 # Matches {param}, {param:fmt}, {param.attr}, {param.attr:fmt}
 _TEMPLATE_PARAM_RE = re.compile(r'\{([\w.]+)(?::(\w+))?\}')
-
-logger = logging.getLogger("nb_cache.key")
 
 
 def get_func_name(func):
@@ -35,24 +32,37 @@ def get_cache_key(func, key_template, args, kwargs):
     else:
         key = _render_template(func, key_template, args, kwargs)
 
-    logger.debug("[nb_cache] func=%s  key=%s", get_func_name(func), key)
     return key
 
 
-def get_cache_key_template(func, key=None, prefix=""):
+def get_cache_key_template(func, key=None, prefix="", key_include_func=True):
     """Build a key template (string or callable) for a function.
 
     When key is a callable, it is stored as-is and will be called at cache time.
-    When key is a string template, it is prefixed with func_name.
+    When key is a string template, it is prefixed with func_name (if include_func_name=True).
     When key is None, auto-generate a template from the function signature.
+
+    Args:
+        func: The decorated function.
+        key: Key template string or callable. None means auto-generate.
+        prefix: Key prefix string (from decorator or setup).
+        key_include_func: If False, the module path and function name are NOT
+            included in the generated key. Useful when you want a short,
+            purely business-logic key (e.g. ``aiof:3_4`` instead of
+            ``__main__:aio_fun:aiof:3_4``).
     """
     func_name = get_func_name(func)
     if key is not None:
         if callable(key):
             return key
-        if prefix:
-            return "{}:{}:{}".format(prefix, func_name, key)
-        return "{}:{}".format(func_name, key)
+        if key_include_func:
+            if prefix:
+                return "{}:{}:{}".format(prefix, func_name, key)
+            return "{}:{}".format(func_name, key)
+        else:
+            if prefix:
+                return "{}:{}".format(prefix, key)
+            return key
 
     sig = inspect.signature(func)
     parts = []
@@ -62,9 +72,14 @@ def get_cache_key_template(func, key=None, prefix=""):
         parts.append("{{{name}}}".format(name=name))
 
     template = ":".join(parts) if parts else ""
-    if prefix:
-        return "{}:{}:{}".format(prefix, func_name, template)
-    return "{}:{}".format(func_name, template)
+    if key_include_func:
+        if prefix:
+            return "{}:{}:{}".format(prefix, func_name, template)
+        return "{}:{}".format(func_name, template)
+    else:
+        if prefix:
+            return "{}:{}".format(prefix, template) if template else prefix
+        return template
 
 
 def _resolve_attr(val, attr_path):

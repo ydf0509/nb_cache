@@ -1486,3 +1486,6 @@ if __name__ == '__main__':
     pytest.main([__file__, '-v'])
 
 
+"""
+python -m pytest tests/ai_codes/test_core.py -v -p no:logfire
+"""
