@@ -1080,6 +1080,408 @@ class TestLockContextManagerAsync:
         asyncio.get_event_loop().run_until_complete(_test())
 
 
+# ============================================================
+# DualBackend 测试（需要 Redis，不可用时自动跳过）
+# ============================================================
+
+def _redis_available():
+    """检测 Redis 是否可用。"""
+    try:
+        import redis
+        r = redis.Redis(host="localhost", port=6379, db=0, socket_timeout=1)
+        r.ping()
+        r.close()
+        return True
+    except Exception:
+        return False
+
+
+_skip_no_redis = pytest.mark.skipif(
+    not _redis_available(), reason="Redis not available on localhost:6379"
+)
+
+
+@_skip_no_redis
+class TestDualBackendDirect:
+    """直接测试 DualBackend 底层操作（L1 内存 + L2 Redis）。"""
+
+    def setup_method(self):
+        from nb_cache.backends.dual import DualBackend
+        self.be = DualBackend(memory_size=100, local_ttl=10,
+                              host="localhost", port=6379, db=0)
+        self.be.init_sync()
+        self.be.clear_sync()
+
+    def teardown_method(self):
+        self.be.clear_sync()
+        self.be.close_sync()
+
+    def test_set_get_sync(self):
+        self.be.set_sync("dk1", "dv1", ttl=60)
+        assert self.be.get_sync("dk1") == "dv1"
+
+    def test_get_miss(self):
+        assert self.be.get_sync("nonexistent") is None
+
+    def test_l1_hit(self):
+        """写入后 L1 内存直接命中，不需要走 Redis。"""
+        self.be.set_sync("dk2", "dv2", ttl=60)
+        # L1 应该有（刚写入）
+        assert self.be._memory.get_sync("dk2") == "dv2"
+        assert self.be.get_sync("dk2") == "dv2"
+
+    def test_l1_miss_l2_hit_and_backfill(self):
+        """L1 没有但 L2 有时，读取后回填 L1。"""
+        # 直接写 Redis（绕过 L1）— Redis 返回 bytes
+        self.be._redis.set_sync("dk3", "dv3", ttl=60)
+        assert self.be._memory.get_sync("dk3") is None  # L1 空
+
+        val = self.be.get_sync("dk3")
+        assert val is not None
+        # 读完后 L1 应被回填（值可能是 bytes 或 str，取决于 Redis）
+        assert self.be._memory.get_sync("dk3") is not None
+
+    def test_delete_sync(self):
+        self.be.set_sync("dk4", "dv4")
+        self.be.delete_sync("dk4")
+        assert self.be.get_sync("dk4") is None
+        assert self.be._memory.get_sync("dk4") is None
+        assert self.be._redis.get_sync("dk4") is None
+
+    def test_exists_sync(self):
+        self.be.set_sync("dk5", "dv5")
+        assert self.be.exists_sync("dk5") is True
+        assert self.be.exists_sync("nope") is False
+
+    def test_incr_sync(self):
+        assert self.be.incr_sync("dcnt") == 1
+        assert self.be.incr_sync("dcnt") == 2
+        assert self.be.incr_sync("dcnt", 3) == 5
+
+    def test_clear_sync(self):
+        self.be.set_sync("dk6", 1)
+        self.be.set_sync("dk7", 2)
+        self.be.clear_sync()
+        assert self.be.get_sync("dk6") is None
+        assert self.be.get_sync("dk7") is None
+
+    def test_get_many_sync(self):
+        self.be.set_sync("da", 10)
+        self.be.set_sync("db", 20)
+        result = self.be.get_many_sync("da", "db", "dc")
+        assert result == [10, 20, None]
+
+    def test_set_many_sync(self):
+        self.be.set_many_sync({"dx": 100, "dy": 200})
+        assert self.be.get_sync("dx") == 100
+        assert self.be.get_sync("dy") == 200
+
+    def test_lock_sync(self):
+        assert self.be.set_lock_sync("dlock", 5) is True
+        assert self.be.is_locked_sync("dlock") is True
+        assert self.be.set_lock_sync("dlock", 5) is False
+        self.be.unlock_sync("dlock")
+        assert self.be.is_locked_sync("dlock") is False
+
+    def test_async_get_set(self):
+        async def _test():
+            await self.be.set("adk1", "adv1", ttl=60)
+            val = await self.be.get("adk1")
+            assert val == "adv1"
+        asyncio.get_event_loop().run_until_complete(_test())
+
+    def test_async_l1_miss_l2_backfill(self):
+        """异步：L1 miss → L2 hit → 回填 L1。"""
+        async def _test():
+            await self.be._redis.set("adk2", "adv2", ttl=60)
+            assert await self.be._memory.get("adk2") is None
+            val = await self.be.get("adk2")
+            assert val is not None
+            assert await self.be._memory.get("adk2") is not None
+        asyncio.get_event_loop().run_until_complete(_test())
+
+
+@_skip_no_redis
+class TestDualCacheDecorator:
+    """通过 Cache().setup("dual://") 使用装饰器的完整端到端测试。"""
+
+    def setup_method(self):
+        self.c = Cache().setup("dual://localhost:6379/0?memory_size=100&local_ttl=10")
+        self.c.clear_sync()
+        self.call_count = 0
+
+    def teardown_method(self):
+        self.c.clear_sync()
+
+    def test_sync_cache_hit(self):
+        @self.c.cache(ttl=60)
+        def compute(x):
+            self.call_count += 1
+            return x * 2
+
+        assert compute(5) == 10
+        assert self.call_count == 1
+        assert compute(5) == 10
+        assert self.call_count == 1  # 命中双缓存
+
+    def test_async_cache_hit(self):
+        @self.c.cache(ttl=60)
+        async def compute_async(x):
+            self.call_count += 1
+            return x * 3
+
+        async def _test():
+            assert await compute_async(4) == 12
+            assert self.call_count == 1
+            assert await compute_async(4) == 12
+            assert self.call_count == 1
+
+        asyncio.get_event_loop().run_until_complete(_test())
+
+    def test_sync_cache_with_lock(self):
+        @self.c.cache(ttl=60, lock=True)
+        def compute_locked(x):
+            self.call_count += 1
+            return x * 5
+
+        assert compute_locked(3) == 15
+        assert self.call_count == 1
+        assert compute_locked(3) == 15
+        assert self.call_count == 1
+
+    def test_direct_operations(self):
+        self.c.set_sync("dkey", "dval", ttl=60)
+        assert self.c.get_sync("dkey") == "dval"
+        self.c.delete_sync("dkey")
+        assert self.c.get_sync("dkey") is None
+
+    def test_transaction_on_dual(self):
+        with self.c.transaction() as tx:
+            tx.set("dtx1", "v1", ttl=60)
+            tx.set("dtx2", "v2", ttl=60)
+        assert self.c.get_sync("dtx1") == "v1"
+        assert self.c.get_sync("dtx2") == "v2"
+
+
+# ============================================================
+# setup() 序列化 kwargs 测试
+# ============================================================
+
+class TestSetupSerializationKwargs:
+    def test_pickle_type_json(self):
+        """setup(pickle_type='json') 应能正常工作。"""
+        c = Cache().setup("mem://", pickle_type="json")
+        c.set_sync("jk", {"a": 1}, ttl=60)
+        assert c.get_sync("jk") == {"a": 1}
+
+    def test_compress_type_gzip(self):
+        """setup(compress_type='gzip') 数据压缩后仍能正确还原。"""
+        c = Cache().setup("mem://", compress_type="gzip")
+        c.set_sync("gk", "hello" * 100, ttl=60)
+        assert c.get_sync("gk") == "hello" * 100
+
+    def test_compress_type_zlib(self):
+        """setup(compress_type='zlib') 同理。"""
+        c = Cache().setup("mem://", compress_type="zlib")
+        c.set_sync("zk", [1, 2, 3] * 50, ttl=60)
+        assert c.get_sync("zk") == [1, 2, 3] * 50
+
+    def test_secret_hmac_signing(self):
+        """setup(secret=...) 数据签名，正常读取不报错。"""
+        c = Cache().setup("mem://", secret="my-secret", digestmod="sha256")
+        c.set_sync("sk", {"signed": True}, ttl=60)
+        assert c.get_sync("sk") == {"signed": True}
+
+    def test_json_gzip_secret_combined(self):
+        """pickle_type + compress_type + secret 三者组合使用。"""
+        c = Cache().setup("mem://", pickle_type="json",
+                          compress_type="gzip", secret="combo-key")
+        data = {"x": list(range(100))}
+        c.set_sync("combo", data, ttl=60)
+        assert c.get_sync("combo") == data
+
+
+# ============================================================
+# setup() 内存 kwargs 测试
+# ============================================================
+
+class TestSetupMemoryKwargs:
+    def test_size_via_setup(self):
+        """通过 setup() 传入 size 参数，LRU 淘汰正常工作。"""
+        c = Cache().setup("mem://", size=3)
+        c.set_sync("a", 1)
+        c.set_sync("b", 2)
+        c.set_sync("c", 3)
+        c.set_sync("d", 4)  # 超过 size=3，淘汰最早的
+        assert c.get_sync("a") is None
+        assert c.get_sync("d") == 4
+
+    def test_size_via_url_query(self):
+        """通过 URL query string 传 size。"""
+        c = Cache().setup("mem://?size=2")
+        c.set_sync("x", 1)
+        c.set_sync("y", 2)
+        c.set_sync("z", 3)
+        assert c.get_sync("x") is None
+        assert c.get_sync("z") == 3
+
+
+# ============================================================
+# setup() 链式调用测试
+# ============================================================
+
+class TestSetupChain:
+    def test_setup_returns_self(self):
+        """Cache().setup() 返回 self，支持链式调用。"""
+        c = Cache().setup("mem://")
+        assert isinstance(c, Cache)
+        assert c.is_setup
+
+    def test_chained_decorator(self):
+        """一行写法可以直接调装饰器。"""
+        cache = Cache().setup("mem://")
+
+        @cache.cache(ttl=60)
+        def fn(x):
+            return x + 1
+
+        assert fn(1) == 2
+
+
+# ============================================================
+# Wrapper 批量操作测试
+# ============================================================
+
+class TestWrapperBatchOperations:
+    def setup_method(self):
+        self.c = Cache().setup("mem://")
+
+    def test_get_many_sync(self):
+        self.c.set_sync("bk1", "bv1")
+        self.c.set_sync("bk2", "bv2")
+        result = self.c.get_many_sync("bk1", "bk2", "bk3")
+        assert result == ["bv1", "bv2", None]
+
+    def test_set_many_sync(self):
+        self.c.set_many_sync({"sm1": 10, "sm2": 20})
+        assert self.c.get_sync("sm1") == 10
+        assert self.c.get_sync("sm2") == 20
+
+    def test_scan_sync(self):
+        self.c.set_sync("user:100", "a")
+        self.c.set_sync("user:200", "b")
+        self.c.set_sync("order:1", "c")
+        keys = self.c.scan_sync("user:*")
+        assert sorted(keys) == ["user:100", "user:200"]
+
+    def test_delete_match_sync(self):
+        self.c.set_sync("tmp:1", "x")
+        self.c.set_sync("tmp:2", "y")
+        self.c.set_sync("keep:1", "z")
+        self.c.delete_match_sync("tmp:*")
+        assert self.c.get_sync("tmp:1") is None
+        assert self.c.get_sync("keep:1") == "z"
+
+    def test_async_batch_operations(self):
+        async def _test():
+            await self.c.set("ak1", "av1", ttl=60)
+            await self.c.set("ak2", "av2", ttl=60)
+            result = await self.c.get_many("ak1", "ak2", "ak3")
+            assert result == ["av1", "av2", None]
+
+        asyncio.get_event_loop().run_until_complete(_test())
+
+
+# ============================================================
+# lock_ttl 参数测试
+# ============================================================
+
+class TestLockTtl:
+    def setup_method(self):
+        self.c = Cache().setup("mem://")
+        self.call_count = 0
+
+    def test_lock_ttl_separate_from_cache_ttl(self):
+        """lock_ttl 独立于 cache ttl，两者可以不同。"""
+        @self.c.cache(ttl=60, lock=True, lock_ttl=5)
+        def compute(x):
+            self.call_count += 1
+            return x * 2
+
+        assert compute(1) == 2
+        assert self.call_count == 1
+        assert compute(1) == 2
+        assert self.call_count == 1  # 命中缓存
+
+    def test_lock_ttl_string_format(self):
+        """lock_ttl 支持字符串格式。"""
+        @self.c.cache(ttl="1h", lock=True, lock_ttl="30s")
+        def compute(x):
+            self.call_count += 1
+            return x
+
+        assert compute(5) == 5
+        assert self.call_count == 1
+
+
+# ============================================================
+# register_backend 自定义后端注册测试
+# ============================================================
+
+class TestRegisterBackend:
+    def test_register_and_use_custom_backend(self):
+        """注册自定义后端 scheme，通过 URL 使用。"""
+        from nb_cache import register_backend
+
+        register_backend("mymem", "nb_cache.backends.memory:MemoryBackend")
+
+        c = Cache().setup("mymem://")
+        c.set_sync("custom_be_key", "ok")
+        assert c.get_sync("custom_be_key") == "ok"
+        assert isinstance(c.backend, MemoryBackend)
+
+
+# ============================================================
+# Wrapper 级别 expire / get_expire 测试
+# ============================================================
+
+class TestWrapperExpire:
+    def setup_method(self):
+        self.c = Cache().setup("mem://")
+
+    def test_expire_sync(self):
+        self.c.set_sync("ek", "ev")
+        self.c.expire_sync("ek", 0.2)
+        assert self.c.get_sync("ek") == "ev"
+        time.sleep(0.3)
+        assert self.c.get_sync("ek") is None
+
+    def test_get_expire_sync(self):
+        self.c.set_sync("ek2", "ev2", ttl=10)
+        remaining = self.c.get_expire_sync("ek2")
+        assert remaining is not None
+        assert 9 <= remaining <= 10
+
+
+# ============================================================
+# ping 测试
+# ============================================================
+
+class TestPing:
+    def test_memory_ping_sync(self):
+        """内存后端 ping 不抛异常。"""
+        c = Cache().setup("mem://")
+        c.ping_sync()  # 不报错即通过
+
+    def test_memory_ping_async(self):
+        c = Cache().setup("mem://")
+
+        async def _test():
+            await c.ping()
+
+        asyncio.get_event_loop().run_until_complete(_test())
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
 

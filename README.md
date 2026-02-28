@@ -39,6 +39,20 @@ def get_hot_data(key):
     return expensive_query(key)
 ```
 
+## 对比 cashews
+
+如果你不懂 `nb_cache` 用法，可以参考 `cashews` 的用法。ai很熟练 `cashews`的用法。
+
+`nb_cache` 对比 `cashews` 的优点：
+
+- 装饰器支持同步和异步函数，通过同一个装饰器来支持。
+- with 支持同步和异步上下文管理器。
+- 所有操作支持asyncio和同步
+
+`cashews` 最大缺点是 不支持同步，只能用于asyncio异步场景。
+
+
+
 ## 后端配置
 
 ### 内存缓存
