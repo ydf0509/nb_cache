@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nb_cache"
-version = "0.1.0"
-description = "更强的缓存装饰器，支持同步和异步函数，支持加锁防止缓存击穿，支持内存和Redis作为缓存器，支持Redis+内存双缓存提高性能"
+version = "0.2"
+description = "`nb_cache` 不仅是一个基础的缓存装饰器，它更像是一把“瑞士军刀”，在彻底抹平同步与异步代码差异的同时，内置了双层缓存、防击穿、防雪崩、限流、熔断等企业级高可用特性。"
 readme = "README.md"
 # license = {text = "MIT"}
 requires-python = ">=3.6"
