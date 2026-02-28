@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nb_cache"
+version = "0.1.0"
+description = "更强的缓存装饰器，支持同步和异步函数，支持加锁防止缓存击穿，支持内存和Redis作为缓存器，支持Redis+内存双缓存提高性能"
+readme = "README.md"
+# license = {text = "MIT"}
+requires-python = ">=3.6"
+authors = [
+    {name = "ydf0509"},
+]
+keywords = ["cache", "redis", "memory", "async", "decorator", "lock"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    # "Topic :: System :: Caching",
+]
+
+[project.optional-dependencies]
+redis = ["redis>=3.0"]
+speedup = ["xxhash", "hiredis"]
+all = ["redis>=3.0", "xxhash", "hiredis"]
+
+[project.urls]
+Homepage = "https://github.com/ydf0509/nb_cache"
+Repository = "https://github.com/ydf0509/nb_cache"
+
+[tool.setuptools.packages.find]
+include = ["nb_cache*"]
+exclude = ["tests*", "cashews*"]
+
+[tool.setuptools]
+license-files = []
+
+
+
+# python -m build && twine upload dist/*
