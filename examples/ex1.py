@@ -8,10 +8,14 @@
 """
 import asyncio
 import time
-import nb_log
+import logging
 from nb_cache import Cache
 
-nb_log.get_logger('nb_cache')
+# import nb_log
+# nb_log.get_logger('nb_cache')
+logger = logging.getLogger("nb_cache.key")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(logging.StreamHandler())
 
 # ================================================================
 #  一、内存缓存（mem://）

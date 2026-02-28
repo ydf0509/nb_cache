@@ -72,11 +72,18 @@ def get_user(user_id):
 async def get_user_async(user_id):
     return await db.query_async(user_id)
 
-# 加锁防止缓存击穿
+# 加锁防止缓存击穿,如果123这个入参没有缓存，但是同一秒请求123这个入参1万次，加上lock=True后，只有第一次请求会真正执行函数，其余请求等待并复用第一次请求的结果，避免"击穿"。
 @cache.cache(ttl=60, lock=True)
 def get_hot_data(key):
+    time.sleep(20)
     return expensive_query(key)
 ```
+
+## 不想吃苦，如何使用ai掌握nb_cache？
+
+`nb_cache_all_docs_and_codes.md` 这个文件包含了nb_cache 的教程和全部源码。 
+你把这个文件发送给ai，ai就能自动帮你掌握 `nb_cache` 的用法。 
+
 
 ## 对比 cashews
 
@@ -781,17 +788,24 @@ def get_data():
     return {"name": "test"}
 ```
 
-## 快速回答
+## 常见问题解答
 
 #### 如何查看缓存最终生成的key是什么？ 
 
 ```
 因为nb_cache 已经在 nb_cache.key 日志命名空间，用debug 日志级别打印了最终生成的key。
 
-所以你可以通过 nb_log.get_logger('nb_cache.key') 来查看。
+所以你可以通过nb_log来查看：
+ nb_log.get_logger('nb_cache.key')
 
-也可以通过 logger = logging.getLogger("nb_cache.key")  logger.setLevel(logging.DEBUG) 来查看。
+也可以通过 原生logging 来查看:
+logger = logging.getLogger("nb_cache.key")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(logging.StreamHandler())
+
 ```
+
+
 
 ## 许可证
 
