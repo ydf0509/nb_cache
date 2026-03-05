@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nb_cache"
-version = "0.2"
+version = "0.3"
 description = "`nb_cache` 不仅是一个基础的缓存装饰器，它在彻底抹平 Python 同步与异步代码差异的同时，开箱即用地提供了内存/Redis双层缓存、防击穿、防雪崩、限流与熔断等企业级高可用特性。"
 readme = "README.md"
 # license = {text = "MIT"}
